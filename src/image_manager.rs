@@ -44,14 +44,41 @@ impl ImageManager {
             AgentError::ProgramUploadError(format!("Failed to compute image_id: {e}"))
         })?;
 
-        // Validate image type early
-        match image_type {
-            "batch" | "aggregation" => {}
+        // Validate image type early and load any existing cached entry
+        let existing = match image_type {
+            "batch" => self.batch_image.read().await.clone(),
+            "aggregation" => self.aggregation_image.read().await.clone(),
             _ => {
                 return Err(AgentError::RequestBuildError(format!(
                     "Invalid image type: {}. Must be 'batch' or 'aggregation'",
                     image_type
                 )));
+            }
+        };
+
+        // If the same image is already stored, reuse it and skip upload.
+        if let Some(existing_info) = existing {
+            if existing_info.image_id == image_id {
+                if !existing_info.market_url.as_str().is_empty() && !existing_info.elf_bytes.is_empty() {
+                    tracing::info!(
+                        "{} image already uploaded. Reusing Image ID: {:?}",
+                        image_type,
+                        image_id
+                    );
+                    return Ok(existing_info);
+                } else {
+                    tracing::info!(
+                        "{} image ID matches cached entry but metadata missing; re-uploading to refresh market URL",
+                        image_type
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "{} image differs from cached version. Replacing. Old ID: {:?}, New ID: {:?}",
+                    image_type,
+                    existing_info.image_id,
+                    image_id
+                );
             }
         }
 
