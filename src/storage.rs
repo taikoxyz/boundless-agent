@@ -2,6 +2,7 @@ use crate::boundless::{AgentError, AgentResult, AsyncProofRequest, ProofRequestS
 use alloy_primitives_v1p2p0::U256;
 use alloy_primitives_v1p2p0::keccak256;
 use serde_json;
+use std::time::Duration;
 use tokio_rusqlite::params;
 use tracing;
 use utoipa::ToSchema;
@@ -19,8 +20,8 @@ impl BoundlessStorage {
 
     fn apply_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         // WAL improves concurrent write behavior; busy_timeout lets readers wait briefly instead of erroring.
-        conn.execute("PRAGMA journal_mode=WAL", [])?;
-        conn.execute("PRAGMA busy_timeout = 5000", [])?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
         Ok(())
     }
 
