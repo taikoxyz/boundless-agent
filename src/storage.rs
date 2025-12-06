@@ -17,13 +17,46 @@ impl BoundlessStorage {
         Self { db_path }
     }
 
+    fn apply_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        // WAL improves concurrent write behavior; busy_timeout lets readers wait briefly instead of erroring.
+        conn.execute("PRAGMA journal_mode=WAL", [])?;
+        conn.execute("PRAGMA busy_timeout = 5000", [])?;
+        Ok(())
+    }
+
+    fn is_locked_error(err: &tokio_rusqlite::Error) -> bool {
+        match err {
+            tokio_rusqlite::Error::Rusqlite(rusqlite::Error::SqliteFailure(e, _)) => {
+                matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            }
+            _ => false,
+        }
+    }
+
+    async fn open_with_pragmas(&self) -> AgentResult<tokio_rusqlite::Connection> {
+        let db_path = self.db_path.clone();
+        let conn = tokio_rusqlite::Connection::open(db_path)
+            .await
+            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
+
+        conn.call(|conn| {
+            Self::apply_pragmas(conn)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
+
+        Ok(conn)
+    }
+
     /// Initialize the database and create tables if they don't exist
     pub async fn initialize(&self) -> AgentResult<()> {
-        let db_path = self.db_path.clone();
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?
-            .call(move |conn| {
+        let conn = self.open_with_pragmas().await?;
+        conn.call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 conn.execute(
                     r#"
                     CREATE TABLE IF NOT EXISTS boundless_requests (
@@ -92,61 +125,79 @@ impl BoundlessStorage {
 
     /// Store a new async request
     pub async fn store_request(&self, request: &AsyncProofRequest) -> AgentResult<()> {
-        let db_path = self.db_path.clone();
-        let request = request.clone();
+        let mut last_err: Option<tokio_rusqlite::Error> = None;
+        for attempt in 0..3 {
+            let req_clone = request.clone();
+            let conn = self.open_with_pragmas().await?;
+            let result = conn
+                .call(move |conn| {
+                    Self::apply_pragmas(conn)?;
+                    let status_json = serde_json::to_string(&req_clone.status)
+                        .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let proof_type_json = serde_json::to_string(&req_clone.proof_type)
+                        .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let config_json = serde_json::to_string(&req_clone.config)
+                        .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let market_request_id_str = format!("0x{:x}", req_clone.market_request_id);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
 
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
-            .call(move |conn| {
-                let status_json = serde_json::to_string(&request.status)
-                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                let proof_type_json = serde_json::to_string(&request.proof_type)
-                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                let config_json = serde_json::to_string(&request.config)
-                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                let market_request_id_str = format!("0x{:x}", request.market_request_id);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+                    // Compute input hash and proof type string for deduplication
+                    let input_hash = Self::compute_input_hash(&req_clone.input);
+                    let proof_type_str = Self::proof_type_to_string(&req_clone.proof_type);
 
-                // Compute input hash and proof type string for deduplication
-                let input_hash = Self::compute_input_hash(&request.input);
-                let proof_type_str = Self::proof_type_to_string(&request.proof_type);
+                    // Set TTL to 12 hours from now (12 * 60 * 60 = 43200 seconds)
+                    let ttl_expires_at = now + 43200;
 
-                // Set TTL to 7 days from now (7 * 24 * 60 * 60 = 604800 seconds)
-                let ttl_expires_at = now + 604800;
+                    conn.execute(
+                        r#"
+                        INSERT OR REPLACE INTO boundless_requests
+                        (request_id, market_request_id, status, proof_type, input_data, config_data,
+                         updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                        "#,
+                        params![
+                            req_clone.request_id,
+                            market_request_id_str,
+                            status_json,
+                            proof_type_json,
+                            req_clone.input,
+                            config_json,
+                            now,
+                            Option::<Vec<u8>>::None, // proof_data initially None
+                            Option::<String>::None,   // error_message initially None
+                            input_hash,
+                            proof_type_str,
+                            ttl_expires_at
+                        ],
+                    ).map_err(|e| e)?;
 
-                conn.execute(
-                    r#"
-                    INSERT OR REPLACE INTO boundless_requests
-                    (request_id, market_request_id, status, proof_type, input_data, config_data,
-                     updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                    "#,
-                    params![
-                        request.request_id,
-                        market_request_id_str,
-                        status_json,
-                        proof_type_json,
-                        request.input,
-                        config_json,
-                        now,
-                        Option::<Vec<u8>>::None, // proof_data initially None
-                        Option::<String>::None,   // error_message initially None
-                        input_hash,
-                        proof_type_str,
-                        ttl_expires_at
-                    ],
-                ).map_err(|e| e)?;
+                    Ok(())
+                })
+                .await;
 
-                Ok(())
-            })
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to store request: {}", e)))?;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(AgentError::ClientBuildError(format!(
+                        "Failed to store request: {}",
+                        e
+                    )))
+                }
+            }
+        }
 
-        Ok(())
+        Err(AgentError::ClientBuildError(format!(
+            "Failed to store request after retries: {:?}",
+            last_err
+        )))
     }
 
     /// Update request status
@@ -155,55 +206,72 @@ impl BoundlessStorage {
         request_id: &str,
         status: &ProofRequestStatus,
     ) -> AgentResult<()> {
-        let db_path = self.db_path.clone();
-        let request_id = request_id.to_string();
-        let status = status.clone();
+        let mut last_err: Option<tokio_rusqlite::Error> = None;
+        for attempt in 0..3 {
+            let request_id = request_id.to_string();
+            let status = status.clone();
+            let conn = self.open_with_pragmas().await?;
+            let result = conn
+                .call(move |conn| {
+                    Self::apply_pragmas(conn)?;
+                    let status_json = serde_json::to_string(&status)
+                        .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
 
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
-            .call(move |conn| {
-                let status_json = serde_json::to_string(&status)
-                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+                    // Extract proof data and error message from status
+                    let (proof_data, error_message) = match &status {
+                        ProofRequestStatus::Fulfilled { proof, .. } => (Some(proof.clone()), None),
+                        ProofRequestStatus::Failed { error } => (None, Some(error.clone())),
+                        _ => (None, None),
+                    };
 
-                // Extract proof data and error message from status
-                let (proof_data, error_message) = match &status {
-                    ProofRequestStatus::Fulfilled { proof, .. } => (Some(proof.clone()), None),
-                    ProofRequestStatus::Failed { error } => (None, Some(error.clone())),
-                    _ => (None, None),
-                };
+                    conn.execute(
+                        r#"
+                        UPDATE boundless_requests 
+                        SET status = ?1, updated_at = ?2, proof_data = ?3, error_message = ?4
+                        WHERE request_id = ?5
+                        "#,
+                        params![status_json, now, proof_data, error_message, request_id],
+                    )
+                    .map_err(|e| e)?;
 
-                conn.execute(
-                    r#"
-                    UPDATE boundless_requests 
-                    SET status = ?1, updated_at = ?2, proof_data = ?3, error_message = ?4
-                    WHERE request_id = ?5
-                    "#,
-                    params![status_json, now, proof_data, error_message, request_id],
-                )
-                .map_err(|e| e)?;
+                    Ok(())
+                })
+                .await;
 
-                Ok(())
-            })
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to update status: {}", e)))?;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(AgentError::ClientBuildError(format!(
+                        "Failed to update status: {}",
+                        e
+                    )))
+                }
+            }
+        }
 
-        Ok(())
+        Err(AgentError::ClientBuildError(format!(
+            "Failed to update status after retries: {:?}",
+            last_err
+        )))
     }
 
     /// Get a request by request ID
     pub async fn get_request(&self, request_id: &str) -> AgentResult<Option<AsyncProofRequest>> {
-        let db_path = self.db_path.clone();
         let request_id = request_id.to_string();
 
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT request_id, market_request_id, status, proof_type, input_data, config_data
@@ -228,12 +296,10 @@ impl BoundlessStorage {
 
     /// List all active (non-completed) requests
     pub async fn list_active_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT request_id, market_request_id, status, proof_type, input_data, config_data
@@ -263,12 +329,10 @@ impl BoundlessStorage {
 
     /// Get all requests that need status polling (submitted or locked)
     pub async fn get_pending_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
 
                 let mut stmt = conn.prepare(
                     r#"
@@ -385,12 +449,10 @@ impl BoundlessStorage {
     /// Delete expired non-successful requests (older than 1 hour)
     /// Returns list of deleted request IDs for memory cleanup
     pub async fn delete_expired_requests(&self) -> AgentResult<Vec<String>> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
                 let mut stmt = conn
                     .prepare(
@@ -449,12 +511,10 @@ impl BoundlessStorage {
     /// Delete completed requests (fulfilled or failed) that have exceeded their TTL
     /// Returns list of deleted request IDs for memory cleanup
     pub async fn delete_expired_ttl_requests(&self) -> AgentResult<Vec<String>> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
                 let mut stmt = conn
                     .prepare(
@@ -516,12 +576,10 @@ impl BoundlessStorage {
     /// Delete all requests from the database
     /// Returns the number of deleted requests
     pub async fn delete_all_requests(&self) -> AgentResult<usize> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 let deleted_count = conn
                     .execute("DELETE FROM boundless_requests", [])
                     .map_err(|e| e)?;
@@ -542,12 +600,10 @@ impl BoundlessStorage {
 
     /// Get database stats
     pub async fn get_stats(&self) -> AgentResult<DatabaseStats> {
-        let db_path = self.db_path.clone();
-
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 // Get total count
                 let total: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM boundless_requests",
