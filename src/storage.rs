@@ -3,6 +3,7 @@ use alloy_primitives_v1p2p0::U256;
 use alloy_primitives_v1p2p0::keccak256;
 use serde_json;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use tokio_rusqlite::params;
 use tracing;
 use utoipa::ToSchema;
@@ -11,11 +12,15 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone)]
 pub struct BoundlessStorage {
     db_path: String,
+    pooled_conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
 impl BoundlessStorage {
     pub fn new(db_path: String) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            pooled_conn: OnceCell::new(),
+        }
     }
 
     fn apply_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -38,19 +43,27 @@ impl BoundlessStorage {
     }
 
     async fn open_with_pragmas(&self) -> AgentResult<tokio_rusqlite::Connection> {
-        let db_path = self.db_path.clone();
-        let conn = tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
+        // Use a single shared connection to reduce open/close overhead and lock churn.
+        let conn = self
+            .pooled_conn
+            .get_or_try_init(|| async {
+                let db_path = self.db_path.clone();
+                let conn = tokio_rusqlite::Connection::open(db_path)
+                    .await
+                    .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
 
-        conn.call(|conn| {
-            Self::apply_pragmas(conn)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
+                conn.call(|conn| {
+                    Self::apply_pragmas(conn)?;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
 
-        Ok(conn)
+                Ok(conn)
+            })
+            .await?;
+
+        Ok(conn.clone())
     }
 
     /// Initialize the database and create tables if they don't exist
@@ -64,6 +77,7 @@ impl BoundlessStorage {
                         request_id TEXT PRIMARY KEY,
                         market_request_id TEXT NOT NULL,
                         status TEXT NOT NULL,
+                        status_code TEXT,
                         proof_type TEXT NOT NULL,
                         input_data BLOB NOT NULL,
                         config_data TEXT NOT NULL,
@@ -88,10 +102,17 @@ impl BoundlessStorage {
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN input_hash TEXT", []);
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN proof_type_str TEXT", []);
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN ttl_expires_at INTEGER", []);
+                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN status_code TEXT", []);
 
                 // Create unique index for input deduplication
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_input_dedup ON boundless_requests(input_hash, proof_type_str) WHERE input_hash IS NOT NULL AND proof_type_str IS NOT NULL",
+                    [],
+                ).map_err(|e| e)?;
+
+                // Index for status_code based filtering
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_status_code ON boundless_requests(status_code)",
                     [],
                 ).map_err(|e| e)?;
 
@@ -124,6 +145,17 @@ impl BoundlessStorage {
         }
     }
 
+    /// Lightweight status code for indexed filters
+    fn status_code(status: &ProofRequestStatus) -> &'static str {
+        match status {
+            ProofRequestStatus::Preparing => "preparing",
+            ProofRequestStatus::Submitted { .. } => "submitted",
+            ProofRequestStatus::Locked { .. } => "locked",
+            ProofRequestStatus::Fulfilled { .. } => "fulfilled",
+            ProofRequestStatus::Failed { .. } => "failed",
+        }
+    }
+
     /// Store a new async request
     pub async fn store_request(&self, request: &AsyncProofRequest) -> AgentResult<()> {
         let mut last_err: Option<tokio_rusqlite::Error> = None;
@@ -148,6 +180,7 @@ impl BoundlessStorage {
                     // Compute input hash and proof type string for deduplication
                     let input_hash = Self::compute_input_hash(&req_clone.input);
                     let proof_type_str = Self::proof_type_to_string(&req_clone.proof_type);
+                    let status_code = Self::status_code(&req_clone.status);
 
                     // Set TTL to 12 hours from now (12 * 60 * 60 = 43200 seconds)
                     let ttl_expires_at = now + 43200;
@@ -155,14 +188,15 @@ impl BoundlessStorage {
                     conn.execute(
                         r#"
                         INSERT OR REPLACE INTO boundless_requests
-                        (request_id, market_request_id, status, proof_type, input_data, config_data,
+                        (request_id, market_request_id, status, status_code, proof_type, input_data, config_data,
                          updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                         "#,
                         params![
                             req_clone.request_id,
                             market_request_id_str,
                             status_json,
+                            status_code,
                             proof_type_json,
                             req_clone.input,
                             config_json,
@@ -217,6 +251,7 @@ impl BoundlessStorage {
                     Self::apply_pragmas(conn)?;
                     let status_json = serde_json::to_string(&status)
                         .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let status_code = Self::status_code(&status);
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -232,10 +267,10 @@ impl BoundlessStorage {
                     conn.execute(
                         r#"
                         UPDATE boundless_requests 
-                        SET status = ?1, updated_at = ?2, proof_data = ?3, error_message = ?4
-                        WHERE request_id = ?5
+                        SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5
+                        WHERE request_id = ?6
                         "#,
-                        params![status_json, now, proof_data, error_message, request_id],
+                        params![status_json, status_code, now, proof_data, error_message, request_id],
                     )
                     .map_err(|e| e)?;
 
@@ -295,7 +330,7 @@ impl BoundlessStorage {
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to get request: {}", e)))
     }
 
-    /// List all active (non-completed) requests
+    /// List all active (non-completed) requests (lightweight projection)
     pub async fn list_active_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
         self.open_with_pragmas()
             .await?
@@ -305,13 +340,50 @@ impl BoundlessStorage {
                     r#"
                     SELECT request_id, market_request_id, status, proof_type, input_data, config_data
                     FROM boundless_requests 
-                    WHERE status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%'
+                    WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
+                       OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')
                     ORDER BY updated_at DESC
                     "#
                 ).map_err(|e| e)?;
 
                 let rows = stmt.query_map([], |row| {
-                    Self::parse_request_row(row)
+                    // Only parse minimal fields; leave input/config empty to avoid BLOB overhead.
+                    let request_id: String = row.get(0)?;
+                    let market_request_id_str: String = row.get(1)?;
+                    let status_json: String = row.get(2)?;
+                    let proof_type_json: String = row.get(3)?;
+
+                    let market_request_id = if market_request_id_str.starts_with("0x") {
+                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                "market_request_id".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?
+                    } else {
+                        U256::ZERO
+                    };
+
+                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
+                    })?;
+                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            3,
+                            "proof_type".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+
+                    Ok(AsyncProofRequest {
+                        request_id,
+                        market_request_id,
+                        status,
+                        proof_type,
+                        input: Vec::new(), // omitted to reduce I/O
+                        config: serde_json::Value::Null, // omitted
+                    })
                 }).map_err(|e| e)?;
 
                 let mut requests = Vec::new();
@@ -328,7 +400,7 @@ impl BoundlessStorage {
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to list requests: {}", e)))
     }
 
-    /// Get all requests that need status polling (submitted or locked)
+    /// Get all requests that need status polling (submitted or locked) - lightweight projection
     pub async fn get_pending_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
         self.open_with_pragmas()
             .await?
@@ -339,13 +411,49 @@ impl BoundlessStorage {
                     r#"
                     SELECT request_id, market_request_id, status, proof_type, input_data, config_data
                     FROM boundless_requests 
-                    WHERE (status LIKE '%Submitted%' OR status LIKE '%Locked%')
+                    WHERE (status_code IS NOT NULL AND status_code IN ('submitted','locked'))
+                       OR (status_code IS NULL AND (status LIKE '%Submitted%' OR status LIKE '%Locked%'))
                     ORDER BY updated_at ASC
                     "#
                 ).map_err(|e| e)?;
 
                 let rows = stmt.query_map([], |row| {
-                    Self::parse_request_row(row)
+                    let request_id: String = row.get(0)?;
+                    let market_request_id_str: String = row.get(1)?;
+                    let status_json: String = row.get(2)?;
+                    let proof_type_json: String = row.get(3)?;
+
+                    let market_request_id = if market_request_id_str.starts_with("0x") {
+                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                "market_request_id".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?
+                    } else {
+                        U256::ZERO
+                    };
+
+                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
+                    })?;
+                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            3,
+                            "proof_type".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+
+                    Ok(AsyncProofRequest {
+                        request_id,
+                        market_request_id,
+                        status,
+                        proof_type,
+                        input: Vec::new(),               // omitted
+                        config: serde_json::Value::Null, // omitted
+                    })
                 }).map_err(|e| e)?;
 
                 let mut requests = Vec::new();
@@ -415,14 +523,13 @@ impl BoundlessStorage {
         input: &[u8],
         proof_type: &ProofType,
     ) -> AgentResult<Option<AsyncProofRequest>> {
-        let db_path = self.db_path.clone();
         let input_hash = Self::compute_input_hash(input);
         let proof_type_str = Self::proof_type_to_string(proof_type);
 
-        tokio_rusqlite::Connection::open(db_path)
-            .await
-            .map_err(|e| AgentError::ClientBuildError(format!("Failed to open database: {}", e)))?
+        self.open_with_pragmas()
+            .await?
             .call(move |conn| {
+                Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT request_id, market_request_id, status, proof_type, input_data, config_data
@@ -460,7 +567,8 @@ impl BoundlessStorage {
                         r#"
                     SELECT request_id FROM boundless_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 3600)
-                    AND status NOT LIKE '%Fulfilled%'
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
+                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
                     )
                     .map_err(|e| e)?;
@@ -550,7 +658,8 @@ impl BoundlessStorage {
                         r#"
                     DELETE FROM boundless_requests
                     WHERE ttl_expires_at < strftime('%s', 'now')
-                    AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')
+                    AND ((status_code IS NOT NULL AND status_code IN ('fulfilled','failed'))
+                         OR (status_code IS NULL AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')))
                     "#,
                         [],
                     )
@@ -614,21 +723,21 @@ impl BoundlessStorage {
 
                 // Get active count
                 let active: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%'",
+                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed')) OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')",
                     [],
                     |row| row.get(0)
                 )?;
 
                 // Get completed count
                 let completed: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE status LIKE '%Fulfilled%'",
+                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code = 'fulfilled') OR (status_code IS NULL AND status LIKE '%Fulfilled%')",
                     [],
                     |row| row.get(0)
                 )?;
 
                 // Get failed count
                 let failed: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE status LIKE '%Failed%'",
+                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code = 'failed') OR (status_code IS NULL AND status LIKE '%Failed%')",
                     [],
                     |row| row.get(0)
                 )?;
