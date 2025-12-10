@@ -18,7 +18,7 @@ use boundless_market::{
 };
 use reqwest::Url;
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
-use risc0_zkvm::{Digest, Receipt as ZkvmReceipt, default_executor};
+use risc0_zkvm::{compute_image_id, Digest, Receipt as ZkvmReceipt, Journal, default_executor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,6 +106,11 @@ impl FromStr for DeploymentType {
 pub struct BoundlessAggregationGuestInput {
     pub image_id: Digest,
     pub receipts: Vec<ZkvmReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundlessAggregationGuestOutput {
+    pub journal_digest: Digest,
 }
 
 // use tokio::sync::OnceCell;
@@ -1016,7 +1021,8 @@ impl BoundlessProver {
         &self,
         request_id: &str,
         input: Vec<u8>,
-        _elf: &[u8],
+        output: Vec<u8>,
+        elf: &[u8],
         image_url: Url,
         offer_params: BoundlessOfferParams,
         proof_type: ProofType,
@@ -1038,8 +1044,8 @@ impl BoundlessProver {
         })?;
 
         // Evaluate cost
-        // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
-        //     .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
+        let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
+            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
         let mcycles_count = 4000;
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
@@ -1059,10 +1065,12 @@ impl BoundlessProver {
             .build_boundless_request(
                 &boundless_client,
                 image_url,
+                elf,
                 input_url,
                 guest_env,
                 &offer_params,
                 mcycles_count as u32,
+                output,
             )
             .await
             .map_err(|e| {
@@ -1108,6 +1116,7 @@ impl BoundlessProver {
         &self,
         request_id: String,
         input: Vec<u8>,
+        output: Vec<u8>,
         config: &serde_json::Value,
     ) -> AgentResult<String> {
         // Check for existing request with same input content for proper deduplication
@@ -1216,6 +1225,7 @@ impl BoundlessProver {
                 .process_and_submit_request(
                     &request_id_clone,
                     input,
+                    output,
                     &image_info.elf_bytes,
                     image_info.market_url,
                     offer_params,
@@ -1238,6 +1248,7 @@ impl BoundlessProver {
         &self,
         request_id: String,
         input: Vec<u8>,
+        output: Vec<u8>,
         config: &serde_json::Value,
     ) -> AgentResult<String> {
         // Check for existing request with same input content for proper deduplication
@@ -1350,6 +1361,7 @@ impl BoundlessProver {
                 .process_and_submit_request(
                     &request_id_clone,
                     input,
+                    output,
                     &image_info.elf_bytes,
                     image_info.market_url,
                     offer_params,
@@ -1529,12 +1541,17 @@ impl BoundlessProver {
         &self,
         boundless_client: &Client,
         program_url: Url,
+        program_bytes: &[u8],
         input_url: Option<Url>,
         guest_env: GuestEnv,
         offer_spec: &BoundlessOfferParams,
         mcycles_count: u32,
+        journal: Vec<u8>,
     ) -> AgentResult<ProofRequest> {
         tracing::info!("offer_spec: {:?}", offer_spec);
+        let image_id = compute_image_id(program_bytes).map_err(|e| {
+            AgentError::ClientBuildError(format!("Failed to compute image_id from program: {e}"))
+        })?;
         let max_price = parse_ether(&offer_spec.max_price_per_mcycle).map_err(|e| {
             AgentError::ClientBuildError(format!(
                 "Failed to parse max_price_per_mcycle: {} ({})",
@@ -1556,11 +1573,14 @@ impl BoundlessProver {
 
         let mut request_params = boundless_client
             .new_request()
+            .with_program(program_bytes.to_vec())
             .with_program_url(program_url)
             .unwrap()
             .with_groth16_proof()
             .with_env(guest_env)
             .with_cycles(mcycles_count as u64 * MILLION_CYCLES)
+            .with_image_id(image_id)
+            .with_journal(Journal::new(journal))
             .with_offer(
                 OfferParams::builder()
                     .ramp_up_period(ramp_up_period)
@@ -1681,7 +1701,7 @@ mod tests {
 
         // loading from tests/fixtures/input-1306738.bin
         let input_bytes = std::fs::read("tests/fixtures/input-1306738.bin").unwrap();
-        let _output_bytes = std::fs::read("tests/fixtures/output-1306738.bin").unwrap();
+        let output_bytes = std::fs::read("tests/fixtures/output-1306738.bin").unwrap();
 
         let config = serde_json::Value::default();
         let image_manager = ImageManager::new();
@@ -1691,7 +1711,7 @@ mod tests {
 
         // Test async request submission - should return a request ID
         let request_id = prover
-            .batch_run("test_request_id".to_string(), input_bytes, &config)
+            .batch_run("test_request_id".to_string(), input_bytes, output_bytes, &config)
             .await
             .unwrap();
         println!("Submitted batch request with ID: {:?}", request_id);
@@ -1740,6 +1760,8 @@ mod tests {
         };
         let input = bincode::serialize(&input_data).unwrap();
         let config = serde_json::Value::default();
+        let output_struct = BoundlessAggregationGuestOutput { journal_digest: Digest::ZERO };
+        let output = bincode::serialize(&output_struct).unwrap();
 
         // Test async aggregation request submission
         let image_manager = ImageManager::new();
@@ -1747,7 +1769,7 @@ mod tests {
             .await
             .unwrap();
         let request_id = prover
-            .aggregate("test_aggregate_request_id".to_string(), input, &config)
+            .aggregate("test_aggregate_request_id".to_string(), input, output, &config)
             .await
             .unwrap();
         println!("Submitted aggregation request with ID: {:?}", request_id);
