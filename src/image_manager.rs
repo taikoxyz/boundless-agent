@@ -252,8 +252,7 @@ impl ImageManager {
             .unwrap_or(3600);
 
         // Refresh a bit before actual expiry to avoid 403; default buffer 120s.
-        let refresh_at = SystemTime::now()
-            + Duration::from_secs(expires_secs.saturating_sub(120));
+        let refresh_at = SystemTime::now() + Duration::from_secs(expires_secs.saturating_sub(120));
 
         Ok((market_url, refresh_at))
     }

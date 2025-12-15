@@ -13,9 +13,10 @@ use super::types::{
     RequestListResponse, UploadImageResponse,
 };
 use crate::{
-    AgentError, AppState, AsyncProofRequest, BoundlessProofType, ProofRequestStatus,
-    generate_request_id,
+    AppState,
 };
+use crate::types::{AsyncProofRequest, ProofRequestStatus};
+use crate::utils::generate_request_id;
 
 /// Convert internal ProofRequestStatus to user-friendly API response
 fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResponse {
@@ -51,6 +52,7 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
             Some(error.clone()),
         ),
     };
+    let last_error = request.last_error.clone().or_else(|| error.clone());
 
     // Extract market_request_id from the status enum when available
     let market_request_id = match &request.status {
@@ -71,6 +73,7 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
         status_message,
         proof_data,
         error,
+        last_error,
     }
 }
 
@@ -142,40 +145,8 @@ pub async fn proof_handler(
         ));
     }
 
-    // Validate ELF data for Update proof type
-    if let ProofType::Update(_) = &request.proof_type {
-        match &request.elf {
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "ValidationError".to_string(),
-                        message: "ELF data is required for Update proof type".to_string(),
-                    }),
-                ));
-            }
-            Some(elf_data) if elf_data.is_empty() => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "ValidationError".to_string(),
-                        message: "ELF data cannot be empty for Update proof type".to_string(),
-                    }),
-                ));
-            }
-            _ => {} // ELF data is valid
-        }
-    }
-
-    // Convert ProofType to BoundlessProofType for request ID generation
-    let boundless_proof_type = match &request.proof_type {
-        ProofType::Batch => BoundlessProofType::Batch,
-        ProofType::Aggregate => BoundlessProofType::Aggregate,
-        ProofType::Update(elf_type) => BoundlessProofType::Update(elf_type.clone()),
-    };
-
     // Generate deterministic request_id
-    let request_id = generate_request_id(&request.input, &boundless_proof_type);
+    let request_id = generate_request_id(&request.input, &request.proof_type);
 
     tracing::info!(
         "Received proof submission: {} (size: {} bytes)",
@@ -212,15 +183,6 @@ pub async fn proof_handler(
             prover
                 .aggregate(request_id.clone(), request.input, request.output, &config)
                 .await
-        }
-        ProofType::Update(elf_type) => {
-            // ELF data validation was already done above, so it should be safe to extract
-            match request.elf {
-                Some(elf_data) => prover.update(request_id.clone(), elf_data, elf_type).await,
-                None => Err(AgentError::RequestBuildError(
-                    "ELF data validation failed".to_string(),
-                )),
-            }
         }
     };
 
@@ -320,6 +282,62 @@ pub async fn get_async_proof_status(
             Json(ErrorResponse {
                 error: "RequestNotFound".to_string(),
                 message: "No proof request found with the specified request_id".to_string(),
+            }),
+        )),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/proof/{request_id}/retry",
+    tag = "Proof",
+    params(
+        ("request_id" = String, Path, description = "Unique request identifier to retry")
+    ),
+    responses(
+        (status = 202, description = "Retry accepted", body = DetailedStatusResponse),
+        (status = 400, description = "Retry not allowed", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse)
+    )
+)]
+/// Retry a failed proof request using stored input/config
+pub async fn retry_proof_handler(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<(StatusCode, Json<DetailedStatusResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let prover = match state.get_or_refresh_prover().await {
+        Ok(prover) => prover,
+        Err(e) => {
+            tracing::error!("Failed to get prover: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "ProverInitializationError".to_string(),
+                    message: "Failed to initialize prover".to_string(),
+                }),
+            ));
+        }
+    };
+
+    match prover.retry_failed_request(&request_id).await {
+        Ok(_) => match prover.get_request_status(&request_id).await {
+            Some(request) => Ok((
+                StatusCode::ACCEPTED,
+                Json(map_status_to_api_response(&request)),
+            )),
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "RequestNotFound".to_string(),
+                    message: "No proof request found with the specified request_id".to_string(),
+                }),
+            )),
+        },
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "RetryError".to_string(),
+                message: e.to_string(),
             }),
         )),
     }
@@ -575,8 +593,8 @@ pub async fn upload_image_handler(
         }
     };
 
-    // Create Boundless client for uploading to market
-    let client = match prover.create_boundless_client().await {
+    // Get cached Boundless client for uploading to market
+    let client = match prover.get_boundless_client().await {
         Ok(client) => client,
         Err(e) => {
             tracing::error!("Failed to create Boundless client: {:?}", e);
@@ -593,7 +611,7 @@ pub async fn upload_image_handler(
     // Upload image using image manager
     let image_info = match state
         .image_manager
-        .store_and_upload_image(&image_type, elf_bytes, &client)
+        .store_and_upload_image(&image_type, elf_bytes, client)
         .await
     {
         Ok(info) => info,

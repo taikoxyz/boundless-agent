@@ -4,18 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::ToSchema;
 
-use crate::ElfType;
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 /// Type of proof to generate
-pub enum ProofType {
-    /// Generate a batch proof
-    Batch,
-    /// Aggregate multiple existing proofs
-    Aggregate,
-    /// Update ELF binary
-    Update(ElfType),
-}
+pub use crate::types::ProofType;
 
 #[derive(Debug, Deserialize, ToSchema)]
 /// Request data for submitting an asynchronous proof request
@@ -76,6 +66,9 @@ pub struct DetailedStatusResponse {
     /// Error message if status is "failed"
     #[schema(example = json!(null))]
     pub error: Option<String>,
+    /// Last recorded error (useful for transient polling issues)
+    #[schema(example = json!(null))]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

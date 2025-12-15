@@ -1,4 +1,5 @@
-use crate::boundless::{AgentError, AgentResult, AsyncProofRequest, ProofRequestStatus, ProofType};
+use crate::boundless::{AgentError, AgentResult};
+use crate::types::{AsyncProofRequest, ProofRequestStatus, ProofType};
 use alloy_primitives_v1p2p0::U256;
 use alloy_primitives_v1p2p0::keccak256;
 use serde_json;
@@ -50,14 +51,24 @@ impl BoundlessStorage {
                 let db_path = self.db_path.clone();
                 let conn = tokio_rusqlite::Connection::open(db_path)
                     .await
-                    .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
+                    .map_err(|e| {
+                        AgentError::ClientBuildError(format!(
+                            "Failed to open SQLite database: {}",
+                            e
+                        ))
+                    })?;
 
                 conn.call(|conn| {
                     Self::apply_pragmas(conn)?;
                     Ok(())
                 })
                 .await
-                .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
+                .map_err(|e| {
+                    AgentError::ClientBuildError(format!(
+                        "Failed to configure SQLite pragmas: {}",
+                        e
+                    ))
+                })?;
 
                 Ok(conn)
             })
@@ -70,7 +81,15 @@ impl BoundlessStorage {
     pub async fn initialize(&self) -> AgentResult<()> {
         let conn = self.open_with_pragmas().await?;
         conn.call(move |conn| {
-                Self::apply_pragmas(conn)?;
+                // Configure incremental auto-vacuum so deletes can shrink the DB file over time.
+                // If the DB was created without INCREMENTAL auto-vacuum, a one-time VACUUM is required.
+                let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+                // 2 == INCREMENTAL
+                if auto_vacuum != 2 {
+                    conn.execute("PRAGMA auto_vacuum = INCREMENTAL", [])?;
+                    conn.execute("VACUUM", [])?;
+                }
+
                 conn.execute(
                     r#"
                     CREATE TABLE IF NOT EXISTS boundless_requests (
@@ -80,10 +99,12 @@ impl BoundlessStorage {
                         status_code TEXT,
                         proof_type TEXT NOT NULL,
                         input_data BLOB NOT NULL,
+                        output_data BLOB,
                         config_data TEXT NOT NULL,
                         updated_at INTEGER NOT NULL,
                         proof_data BLOB,
                         error_message TEXT,
+                        last_error TEXT,
                         input_hash TEXT,
                         proof_type_str TEXT,
                         ttl_expires_at INTEGER
@@ -92,17 +113,16 @@ impl BoundlessStorage {
                     [],
                 ).map_err(|e| e)?;
 
-                // Create index for faster status queries
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_status ON boundless_requests(status)",
-                    [],
-                ).map_err(|e| e)?;
-
                 // Migrate existing database by adding new columns if they don't exist
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN input_hash TEXT", []);
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN proof_type_str TEXT", []);
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN ttl_expires_at INTEGER", []);
                 let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN status_code TEXT", []);
+                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN last_error TEXT", []);
+                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN output_data BLOB", []);
+
+                // Drop legacy index on JSON status to reduce write amplification.
+                let _ = conn.execute("DROP INDEX IF EXISTS idx_status", []);
 
                 // Create unique index for input deduplication
                 conn.execute(
@@ -141,7 +161,6 @@ impl BoundlessStorage {
         match proof_type {
             ProofType::Batch => "batch".to_string(),
             ProofType::Aggregate => "aggregate".to_string(),
-            ProofType::Update(_) => "update".to_string(),
         }
     }
 
@@ -164,7 +183,6 @@ impl BoundlessStorage {
             let conn = self.open_with_pragmas().await?;
             let result = conn
                 .call(move |conn| {
-                    Self::apply_pragmas(conn)?;
                     let status_json = serde_json::to_string(&req_clone.status)
                         .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
                     let proof_type_json = serde_json::to_string(&req_clone.proof_type)
@@ -182,15 +200,15 @@ impl BoundlessStorage {
                     let proof_type_str = Self::proof_type_to_string(&req_clone.proof_type);
                     let status_code = Self::status_code(&req_clone.status);
 
-                    // Set TTL to 12 hours from now (12 * 60 * 60 = 43200 seconds)
-                    let ttl_expires_at = now + 43200;
+                    // Set TTL to 3 hours from now (3 * 60 * 60 = 10800 seconds)
+                    let ttl_expires_at = now + 10800;
 
                     conn.execute(
                         r#"
                         INSERT OR REPLACE INTO boundless_requests
-                        (request_id, market_request_id, status, status_code, proof_type, input_data, config_data,
-                         updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        (request_id, market_request_id, status, status_code, proof_type, input_data, output_data, config_data,
+                         updated_at, proof_data, error_message, last_error, input_hash, proof_type_str, ttl_expires_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                         "#,
                         params![
                             req_clone.request_id,
@@ -199,10 +217,12 @@ impl BoundlessStorage {
                             status_code,
                             proof_type_json,
                             req_clone.input,
+                            req_clone.output,
                             config_json,
                             now,
                             Option::<Vec<u8>>::None, // proof_data initially None
                             Option::<String>::None,   // error_message initially None
+                            req_clone.last_error,
                             input_hash,
                             proof_type_str,
                             ttl_expires_at
@@ -217,14 +237,17 @@ impl BoundlessStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to store request: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -248,7 +271,6 @@ impl BoundlessStorage {
             let conn = self.open_with_pragmas().await?;
             let result = conn
                 .call(move |conn| {
-                    Self::apply_pragmas(conn)?;
                     let status_json = serde_json::to_string(&status)
                         .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
                     let status_code = Self::status_code(&status);
@@ -263,14 +285,19 @@ impl BoundlessStorage {
                         ProofRequestStatus::Failed { error } => (None, Some(error.clone())),
                         _ => (None, None),
                     };
+                    let last_error = match &status {
+                        ProofRequestStatus::Failed { error } => Some(error.clone()),
+                        _ => None,
+                    };
 
                     conn.execute(
                         r#"
                         UPDATE boundless_requests 
-                        SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5
-                        WHERE request_id = ?6
+                        SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5, last_error = ?6
+                        WHERE request_id = ?7
+                          AND (status_code IS NULL OR status_code != ?2 OR status != ?1)
                         "#,
-                        params![status_json, status_code, now, proof_data, error_message, request_id],
+                        params![status_json, status_code, now, proof_data, error_message, last_error, request_id],
                     )
                     .map_err(|e| e)?;
 
@@ -282,14 +309,17 @@ impl BoundlessStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to update status: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -300,25 +330,42 @@ impl BoundlessStorage {
         )))
     }
 
-    /// Get a request by request ID
-    pub async fn get_request(&self, request_id: &str) -> AgentResult<Option<AsyncProofRequest>> {
+    /// Get a request by request ID.
+    /// When `include_blobs` is false, avoids loading input/output/config BLOBs.
+    pub async fn get_request(
+        &self,
+        request_id: &str,
+        include_blobs: bool,
+    ) -> AgentResult<Option<AsyncProofRequest>> {
         let request_id = request_id.to_string();
 
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
-                let mut stmt = conn.prepare(
+                let sql = if include_blobs {
                     r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
-                    FROM boundless_requests 
+                    SELECT request_id, market_request_id, status, proof_type, input_data, output_data, config_data, last_error
+                    FROM boundless_requests
                     WHERE request_id = ?1
                     "#
-                ).map_err(|e| e)?;
+                } else {
+                    r#"
+                    SELECT request_id, market_request_id, status, proof_type, last_error
+                    FROM boundless_requests
+                    WHERE request_id = ?1
+                    "#
+                };
 
-                let mut rows = stmt.query_map([request_id], |row| {
-                    Self::parse_request_row(row)
-                }).map_err(|e| e)?;
+                let mut stmt = conn.prepare(sql).map_err(|e| e)?;
+                let mut rows = stmt
+                    .query_map([request_id], |row| {
+                        if include_blobs {
+                            Self::parse_request_row(row)
+                        } else {
+                            Self::parse_request_row_light(row)
+                        }
+                    })
+                    .map_err(|e| e)?;
 
                 match rows.next() {
                     Some(Ok(request)) => Ok(Some(request)),
@@ -335,10 +382,9 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
+                    SELECT request_id, market_request_id, status, proof_type, last_error
                     FROM boundless_requests 
                     WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                        OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')
@@ -346,45 +392,9 @@ impl BoundlessStorage {
                     "#
                 ).map_err(|e| e)?;
 
-                let rows = stmt.query_map([], |row| {
-                    // Only parse minimal fields; leave input/config empty to avoid BLOB overhead.
-                    let request_id: String = row.get(0)?;
-                    let market_request_id_str: String = row.get(1)?;
-                    let status_json: String = row.get(2)?;
-                    let proof_type_json: String = row.get(3)?;
-
-                    let market_request_id = if market_request_id_str.starts_with("0x") {
-                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
-                            rusqlite::Error::InvalidColumnType(
-                                1,
-                                "market_request_id".to_string(),
-                                rusqlite::types::Type::Text,
-                            )
-                        })?
-                    } else {
-                        U256::ZERO
-                    };
-
-                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
-                    })?;
-                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(
-                            3,
-                            "proof_type".to_string(),
-                            rusqlite::types::Type::Text,
-                        )
-                    })?;
-
-                    Ok(AsyncProofRequest {
-                        request_id,
-                        market_request_id,
-                        status,
-                        proof_type,
-                        input: Vec::new(), // omitted to reduce I/O
-                        config: serde_json::Value::Null, // omitted
-                    })
-                }).map_err(|e| e)?;
+                let rows =
+                    stmt.query_map([], |row| Self::parse_request_row_light(row))
+                        .map_err(|e| e)?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -405,11 +415,9 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
-
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
+                    SELECT request_id, market_request_id, status, proof_type, last_error
                     FROM boundless_requests 
                     WHERE (status_code IS NOT NULL AND status_code IN ('submitted','locked'))
                        OR (status_code IS NULL AND (status LIKE '%Submitted%' OR status LIKE '%Locked%'))
@@ -417,44 +425,9 @@ impl BoundlessStorage {
                     "#
                 ).map_err(|e| e)?;
 
-                let rows = stmt.query_map([], |row| {
-                    let request_id: String = row.get(0)?;
-                    let market_request_id_str: String = row.get(1)?;
-                    let status_json: String = row.get(2)?;
-                    let proof_type_json: String = row.get(3)?;
-
-                    let market_request_id = if market_request_id_str.starts_with("0x") {
-                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
-                            rusqlite::Error::InvalidColumnType(
-                                1,
-                                "market_request_id".to_string(),
-                                rusqlite::types::Type::Text,
-                            )
-                        })?
-                    } else {
-                        U256::ZERO
-                    };
-
-                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
-                    })?;
-                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(
-                            3,
-                            "proof_type".to_string(),
-                            rusqlite::types::Type::Text,
-                        )
-                    })?;
-
-                    Ok(AsyncProofRequest {
-                        request_id,
-                        market_request_id,
-                        status,
-                        proof_type,
-                        input: Vec::new(),               // omitted
-                        config: serde_json::Value::Null, // omitted
-                    })
-                }).map_err(|e| e)?;
+                let rows =
+                    stmt.query_map([], |row| Self::parse_request_row_light(row))
+                        .map_err(|e| e)?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -477,7 +450,9 @@ impl BoundlessStorage {
         let status_json: String = row.get(2)?;
         let proof_type_json: String = row.get(3)?;
         let input_data: Vec<u8> = row.get(4)?;
-        let config_json: String = row.get(5)?;
+        let output_data: Option<Vec<u8>> = row.get(5)?;
+        let config_json: String = row.get(6)?;
+        let last_error: Option<String> = row.get(7)?;
 
         // Parse market_request_id from hex string
         let market_request_id = if market_request_id_str.starts_with("0x") {
@@ -504,7 +479,7 @@ impl BoundlessStorage {
             )
         })?;
         let config: serde_json::Value = serde_json::from_str(&config_json).map_err(|_| {
-            rusqlite::Error::InvalidColumnType(5, "config".to_string(), rusqlite::types::Type::Text)
+            rusqlite::Error::InvalidColumnType(6, "config".to_string(), rusqlite::types::Type::Text)
         })?;
 
         Ok(AsyncProofRequest {
@@ -513,7 +488,56 @@ impl BoundlessStorage {
             status,
             proof_type,
             input: input_data,
+            output: output_data.unwrap_or_default(),
             config,
+            last_error,
+        })
+    }
+
+    /// Parse a lightweight projection (no blobs) into AsyncProofRequest.
+    fn parse_request_row_light(row: &rusqlite::Row) -> Result<AsyncProofRequest, rusqlite::Error> {
+        let request_id: String = row.get(0)?;
+        let market_request_id_str: String = row.get(1)?;
+        let status_json: String = row.get(2)?;
+        let proof_type_json: String = row.get(3)?;
+        let last_error: Option<String> = row.get(4)?;
+
+        let market_request_id = if market_request_id_str.starts_with("0x") {
+            U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
+                rusqlite::Error::InvalidColumnType(
+                    1,
+                    "market_request_id".to_string(),
+                    rusqlite::types::Type::Text,
+                )
+            })?
+        } else {
+            U256::ZERO
+        };
+
+        let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                2,
+                "status".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?;
+        let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                3,
+                "proof_type".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?;
+
+        Ok(AsyncProofRequest {
+            request_id,
+            market_request_id,
+            status,
+            proof_type,
+            input: Vec::new(),
+            output: Vec::new(),
+            config: serde_json::Value::Null,
+            last_error,
         })
     }
 
@@ -529,10 +553,9 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
+                    SELECT request_id, market_request_id, status, proof_type, input_data, output_data, config_data, last_error
                     FROM boundless_requests 
                     WHERE input_hash = ?1 AND proof_type_str = ?2
                     ORDER BY updated_at DESC
@@ -560,7 +583,6 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
                 let mut stmt = conn
                     .prepare(
@@ -623,7 +645,6 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
                 let mut stmt = conn
                     .prepare(
@@ -670,6 +691,15 @@ impl BoundlessStorage {
                         "Deleted {} TTL-expired completed requests from database",
                         deleted_count
                     );
+
+                    // Shrink WAL and reclaim free pages in the main DB file.
+                    conn.execute_batch(
+                        r#"
+                        PRAGMA wal_checkpoint(TRUNCATE);
+                        PRAGMA incremental_vacuum(0);
+                        "#,
+                    )
+                    .map_err(|e| e)?;
                 }
 
                 Ok(deleted_ids)
@@ -689,7 +719,6 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 let deleted_count = conn
                     .execute("DELETE FROM boundless_requests", [])
                     .map_err(|e| e)?;
@@ -713,7 +742,6 @@ impl BoundlessStorage {
         self.open_with_pragmas()
             .await?
             .call(move |conn| {
-                Self::apply_pragmas(conn)?;
                 // Get total count
                 let total: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM boundless_requests",

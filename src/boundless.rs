@@ -1,366 +1,36 @@
-use std::str::FromStr;
-use std::time::Duration;
-use tokio::time::timeout;
-
+use crate::config::{BoundlessConfig, BoundlessOfferParams};
+#[cfg(test)]
+use crate::config::{
+    BoundlessAggregationGuestInput, BoundlessAggregationGuestOutput, DeploymentConfig,
+    DeploymentType, OfferParamsConfig,
+};
 use crate::image_manager::ImageManager;
 use crate::storage::BoundlessStorage;
-use alloy_primitives_v1p2p0::{
-    U256, hex, keccak256,
-    utils::{parse_ether, parse_units},
-};
-use alloy_signer_local_v1p0p12::PrivateKeySigner;
+use crate::types::{AsyncProofRequest, ProofRequestStatus, ProofType};
+#[cfg(test)]
+use crate::types::Risc0Response;
+use crate::utils::parse_staking_token;
+use alloy_primitives_v1p2p0::{U256, utils::parse_ether};
 use boundless_market::{
     Client, ProofRequest,
-    contracts::RequestStatus,
-    deployments::{BASE, Deployment, SEPOLIA},
+    deployments::Deployment,
     input::GuestEnv,
     request_builder::OfferParams,
 };
 use reqwest::Url;
-use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
-use risc0_zkvm::{compute_image_id, Digest, Receipt as ZkvmReceipt, Journal, default_executor};
+use risc0_zkvm::{Journal, compute_image_id, default_executor};
+#[cfg(test)]
+use risc0_zkvm::{Digest, Receipt as ZkvmReceipt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{OnceCell, RwLock};
 use tokio::task::JoinHandle;
-use utoipa::ToSchema;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProofRequestStatus {
-    Preparing,
-    Submitted {
-        market_request_id: U256,
-    },
-    Locked {
-        market_request_id: U256,
-        prover: Option<String>,
-    },
-    Fulfilled {
-        market_request_id: U256,
-        proof: Vec<u8>,
-    },
-    Failed {
-        error: String,
-    },
-}
-
-/// Async proof request tracking
-#[derive(Debug, Clone, Serialize)]
-pub struct AsyncProofRequest {
-    pub request_id: String,
-    pub market_request_id: U256,
-    pub status: ProofRequestStatus,
-    pub proof_type: ProofType,
-    pub input: Vec<u8>,
-    pub config: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub enum ElfType {
-    Batch,
-    Aggregation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProofType {
-    Batch,
-    Aggregate,
-    Update(ElfType),
-}
-
-/// Generate deterministic request ID from input and proof type
-pub fn generate_request_id(input: &[u8], proof_type: &ProofType) -> String {
-    let input_hash = keccak256(input);
-    let proof_type_str = match proof_type {
-        ProofType::Batch => "batch",
-        ProofType::Aggregate => "aggregate",
-        ProofType::Update(_) => "update",
-    };
-    format!("{}_{}", hex::encode(input_hash), proof_type_str)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DeploymentType {
-    Sepolia,
-    Base,
-}
-
-impl FromStr for DeploymentType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "sepolia" | "SEPOLIA" => Ok(DeploymentType::Sepolia),
-            "base" | "BASE" => Ok(DeploymentType::Base),
-            _ => Err(format!(
-                "Invalid deployment type: '{}'. Must be 'sepolia' or 'base'",
-                s
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundlessAggregationGuestInput {
-    pub image_id: Digest,
-    pub receipts: Vec<ZkvmReceipt>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundlessAggregationGuestOutput {
-    pub journal_digest: Digest,
-}
-
-// use tokio::sync::OnceCell;
 
 // Constants
-const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MILLION_CYCLES: u64 = 1_000_000;
-const STAKE_TOKEN_DECIMALS: u8 = 18;
-
-/// Generic retry function with exponential backoff
-async fn retry_with_backoff<F, Fut, T, E>(
-    operation_name: &str,
-    operation: F,
-    max_retries: u32,
-) -> Result<T, E>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    let mut attempt = 0;
-    let mut delay = Duration::from_secs(1); // Start with 1 second
-
-    loop {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) if attempt >= max_retries => {
-                tracing::error!(
-                    "{} failed after {} attempts: {}",
-                    operation_name,
-                    attempt,
-                    e
-                );
-                return Err(e);
-            }
-            Err(e) => {
-                attempt += 1;
-                tracing::warn!(
-                    "{} failed (attempt {}/{}): {}, retrying in {:?}",
-                    operation_name,
-                    attempt,
-                    max_retries,
-                    e,
-                    delay
-                );
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(30)); // Cap at 30 seconds
-            }
-        }
-    }
-}
-
-// now staking token is ZSC, so we need to parse it as ZSC whose decimals is 18
-pub fn parse_staking_token(token: &str) -> AgentResult<U256> {
-    let parsed = parse_units(token, STAKE_TOKEN_DECIMALS).map_err(|e| {
-        AgentError::ClientBuildError(format!("Failed to parse stacking: {} ({})", token, e))
-    })?;
-    Ok(parsed.into())
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Risc0Response {
-    pub seal: Vec<u8>,
-    pub journal: Vec<u8>,
-    pub receipt: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BoundlessOfferParams {
-    pub ramp_up_sec: u32,
-    pub lock_timeout_ms_per_mcycle: u32,
-    pub timeout_ms_per_mcycle: u32,
-    pub max_price_per_mcycle: String,
-    pub min_price_per_mcycle: String,
-    pub lock_collateral: String,
-}
-
-impl Default for BoundlessOfferParams {
-    fn default() -> Self {
-        Self {
-            ramp_up_sec: 200,
-            lock_timeout_ms_per_mcycle: 1000,
-            timeout_ms_per_mcycle: 3000,
-            max_price_per_mcycle: "0.00001".to_string(),
-            min_price_per_mcycle: "0.000003".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-}
-
-impl BoundlessOfferParams {
-    fn aggregation() -> Self {
-        Self {
-            ramp_up_sec: 200,
-            lock_timeout_ms_per_mcycle: 1000,
-            timeout_ms_per_mcycle: 3000,
-            max_price_per_mcycle: "0.00001".to_string(),
-            min_price_per_mcycle: "0.000003".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-
-    fn batch() -> Self {
-        Self {
-            ramp_up_sec: 1000,
-            lock_timeout_ms_per_mcycle: 5000,
-            timeout_ms_per_mcycle: 3600 * 3,
-            max_price_per_mcycle: "0.00003".to_string(),
-            min_price_per_mcycle: "0.000005".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BoundlessConfig {
-    pub deployment: Option<DeploymentConfig>,
-    pub offer_params: Option<OfferParamsConfig>,
-    pub rpc_url: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeploymentConfig {
-    pub deployment_type: Option<DeploymentType>,
-    pub overrides: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OfferParamsConfig {
-    pub batch: Option<BoundlessOfferParams>,
-    pub aggregation: Option<BoundlessOfferParams>,
-}
-
-impl Default for BoundlessConfig {
-    fn default() -> Self {
-        Self {
-            deployment: Some(DeploymentConfig {
-                deployment_type: Some(DeploymentType::Sepolia),
-                overrides: None,
-            }),
-            offer_params: Some(OfferParamsConfig {
-                batch: Some(BoundlessOfferParams::batch()),
-                aggregation: Some(BoundlessOfferParams::aggregation()),
-            }),
-            rpc_url: None,
-        }
-    }
-}
-
-impl BoundlessConfig {
-    /// Merge this config with another config, taking values from other where provided
-    pub fn merge(&mut self, other: &BoundlessConfig) {
-        // Merge deployment config if provided
-        if let Some(other_deployment) = &other.deployment {
-            if let Some(ref mut deployment) = self.deployment {
-                // Merge deployment type
-                if let Some(deployment_type) = &other_deployment.deployment_type {
-                    deployment.deployment_type = Some(deployment_type.clone());
-                }
-
-                // Merge deployment overrides
-                if let Some(other_overrides) = &other_deployment.overrides {
-                    if let Some(ref mut overrides) = deployment.overrides {
-                        // Merge JSON objects
-                        if let (Some(obj1), Some(obj2)) =
-                            (overrides.as_object_mut(), other_overrides.as_object())
-                        {
-                            for (key, value) in obj2 {
-                                obj1.insert(key.clone(), value.clone());
-                            }
-                        }
-                    } else {
-                        deployment.overrides = Some(other_overrides.clone());
-                    }
-                }
-            } else {
-                self.deployment = Some(other_deployment.clone());
-            }
-        }
-
-        // Merge offer params if provided
-        if let Some(other_offer_params) = &other.offer_params {
-            if let Some(ref mut offer_params) = self.offer_params {
-                if let Some(batch) = &other_offer_params.batch {
-                    offer_params.batch = Some(batch.clone());
-                }
-                if let Some(aggregation) = &other_offer_params.aggregation {
-                    offer_params.aggregation = Some(aggregation.clone());
-                }
-            } else {
-                self.offer_params = Some(other_offer_params.clone());
-            }
-        }
-
-        // Merge rpc_url if provided
-        if let Some(rpc_url) = &other.rpc_url {
-            self.rpc_url = Some(rpc_url.clone());
-        }
-    }
-
-    /// Get the effective deployment type, using default if not specified
-    pub fn get_deployment_type(&self) -> DeploymentType {
-        self.deployment
-            .as_ref()
-            .and_then(|d| d.deployment_type.as_ref())
-            .cloned()
-            .unwrap_or(DeploymentType::Sepolia)
-    }
-
-    /// Get the effective deployment configuration by merging with base deployment
-    pub fn get_effective_deployment(&self) -> Deployment {
-        let deployment_type = self.get_deployment_type();
-        let mut deployment = match deployment_type {
-            DeploymentType::Sepolia => SEPOLIA,
-            DeploymentType::Base => BASE,
-        };
-
-        // Apply deployment overrides if provided
-        if let Some(deployment_config) = &self.deployment {
-            if let Some(overrides) = &deployment_config.overrides {
-                if let Some(order_stream_url) =
-                    overrides.get("order_stream_url").and_then(|v| v.as_str())
-                {
-                    deployment.order_stream_url =
-                        Some(std::borrow::Cow::Owned(order_stream_url.to_string()));
-                }
-            }
-        }
-
-        deployment
-    }
-
-    /// Get the effective batch offer params, using default if not specified
-    pub fn get_batch_offer_params(&self) -> BoundlessOfferParams {
-        self.offer_params
-            .as_ref()
-            .and_then(|o| o.batch.as_ref())
-            .cloned()
-            .unwrap_or_else(BoundlessOfferParams::batch)
-    }
-
-    /// Get the effective aggregation offer params, using default if not specified
-    pub fn get_aggregation_offer_params(&self) -> BoundlessOfferParams {
-        self.offer_params
-            .as_ref()
-            .and_then(|o| o.aggregation.as_ref())
-            .cloned()
-            .unwrap_or_else(BoundlessOfferParams::aggregation)
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProverConfig {
@@ -384,14 +54,30 @@ impl Default for ProverConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BoundlessProver {
-    config: ProverConfig,
-    deployment: Deployment,
-    boundless_config: BoundlessConfig,
-    active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    storage: BoundlessStorage,
-    image_manager: ImageManager,
+    pub(crate) config: ProverConfig,
+    pub(crate) deployment: Deployment,
+    pub(crate) boundless_config: BoundlessConfig,
+    pub(crate) client: Arc<OnceCell<Client>>,
+    pub(crate) active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
+    pub(crate) poll_error_counts: Arc<RwLock<HashMap<String, u32>>>,
+    pub(crate) storage: BoundlessStorage,
+    pub(crate) image_manager: ImageManager,
+}
+
+impl std::fmt::Debug for BoundlessProver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundlessProver")
+            .field("config", &self.config)
+            .field("deployment", &self.deployment)
+            .field("boundless_config", &self.boundless_config)
+            .field("active_requests", &"<RwLock<HashMap<..>>>")
+            .field("poll_error_counts", &"<RwLock<HashMap<..>>>")
+            .field("storage", &self.storage)
+            .field("image_manager", &self.image_manager)
+            .finish()
+    }
 }
 
 static TTL_CLEANUP_HANDLE: OnceLock<tokio::sync::Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
@@ -405,6 +91,10 @@ fn ttl_cleanup_handle() -> &'static tokio::sync::Mutex<Option<JoinHandle<()>>> {
 pub enum AgentError {
     #[error("Failed to build boundless client: {0}")]
     ClientBuildError(String),
+    #[error("Transient polling error: {0}")]
+    PollingError(String),
+    #[error("Retry error: {0}")]
+    RetryError(String),
     #[error("Failed to encode guest environment: {0}")]
     GuestEnvEncodeError(String),
     #[error("Failed to upload input: {0}")]
@@ -439,254 +129,8 @@ impl BoundlessProver {
         Ok(config.boundless_config.get_effective_deployment())
     }
 
-    /// Create a boundless client with the current configuration
-    pub async fn create_boundless_client(&self) -> AgentResult<Client> {
-        let deployment = Some(self.deployment.clone());
-        let storage_provider = boundless_market::storage::storage_provider_from_env().ok();
-
-        let url = Url::parse(&self.config.rpc_url).unwrap();
-        let sender_priv_key = std::env::var("BOUNDLESS_SIGNER_KEY").unwrap_or_else(|_| {
-            panic!("BOUNDLESS_SIGNER_KEY is not set");
-        });
-        let signer: PrivateKeySigner = sender_priv_key.parse().unwrap();
-
-        let client = Client::builder()
-            .with_rpc_url(url)
-            .with_deployment(deployment)
-            .with_storage_provider(storage_provider)
-            .with_private_key(signer)
-            .build()
-            .await
-            .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
-
-        Ok(client)
-    }
-
-    /// Submit request to boundless market with retry logic
-    async fn submit_request_async(
-        &self,
-        boundless_client: &Client,
-        request: ProofRequest,
-    ) -> AgentResult<U256> {
-        // Send the request to the market with retry logic
-        let request_id = if self.config.offchain {
-            tracing::info!(
-                "Submitting request offchain to {:?}",
-                &self.deployment.order_stream_url
-            );
-
-            retry_with_backoff(
-                "submit_request_offchain",
-                || async {
-                    boundless_client
-                        .submit_request_offchain(&request)
-                        .await
-                        .map_err(|e| {
-                            AgentError::RequestSubmitError(format!(
-                                "Failed to submit request offchain: {e}"
-                            ))
-                        })
-                },
-                MAX_RETRY_ATTEMPTS,
-            )
-            .await?
-            .0
-        } else {
-            retry_with_backoff(
-                "submit_request_onchain",
-                || async {
-                    boundless_client
-                        .submit_request_onchain(&request)
-                        .await
-                        .map_err(|e| {
-                            AgentError::RequestSubmitError(format!(
-                                "Failed to submit request onchain: {e}"
-                            ))
-                        })
-                },
-                MAX_RETRY_ATTEMPTS,
-            )
-            .await?
-            .0
-        };
-
-        let request_id_str = format!("0x{:x}", request_id);
-        tracing::info!("Request {} submitted successfully", request_id_str);
-
-        Ok(request_id)
-    }
-
-    /// Check boundless market status and update request tracking
-    async fn check_market_status(
-        &self,
-        market_request_id: U256,
-        proof_type: &ProofType,
-    ) -> AgentResult<ProofRequestStatus> {
-        let boundless_client = self.create_boundless_client().await?;
-        let request_id_str = format!("0x{:x}", market_request_id);
-
-        // First, check the current status using get_status with retry logic
-        let status_result = retry_with_backoff(
-            "get_market_status",
-            || {
-                boundless_client
-                    .boundless_market
-                    .get_status(market_request_id, Some(u64::MAX))
-            },
-            3, // Fewer retries for status checks since we poll periodically
-        )
-        .await;
-
-        match status_result {
-            Ok(status) => {
-                match status {
-                    RequestStatus::Unknown => {
-                        tracing::info!(
-                            "Market status: MarketSubmitted({}) - open for bidding",
-                            request_id_str
-                        );
-                        Ok(ProofRequestStatus::Submitted { market_request_id })
-                    }
-                    RequestStatus::Locked => {
-                        tracing::info!(
-                            "Market status: MarketLocked({}) - prover committed",
-                            request_id_str
-                        );
-                        Ok(ProofRequestStatus::Locked {
-                            market_request_id,
-                            prover: None,
-                        })
-                    }
-                    RequestStatus::Fulfilled => {
-                        tracing::info!(
-                            "Market status: MarketFulfilled({}) - proof completed",
-                            request_id_str
-                        );
-
-                        // Get the actual proof data with retry logic since we know it's fulfilled
-                        let fulfillment_result = retry_with_backoff(
-                            "get_request_fulfillment",
-                            || {
-                                boundless_client
-                                    .boundless_market
-                                    .get_request_fulfillment(market_request_id)
-                            },
-                            MAX_RETRY_ATTEMPTS,
-                        )
-                        .await;
-
-                        match fulfillment_result {
-                            Ok(fulfillment) => {
-                                // Decode fulfillment data using the data() method first
-                                let journal = match fulfillment.data() {
-                                    Ok(fulfillment_data) => match fulfillment_data.journal() {
-                                        Some(j) => j.to_vec(),
-                                        None => {
-                                            tracing::error!(
-                                                "No journal found in fulfillment data for {}",
-                                                request_id_str
-                                            );
-                                            return Ok(ProofRequestStatus::Failed {
-                                                error: AgentError::MissingJournalError.to_string(),
-                                            });
-                                        }
-                                    },
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to decode fulfillment data for {}: {}",
-                                            request_id_str,
-                                            e
-                                        );
-                                        return Ok(ProofRequestStatus::Failed {
-                                            error: AgentError::FulfillmentDecodeError(
-                                                e.to_string(),
-                                            )
-                                            .to_string(),
-                                        });
-                                    }
-                                };
-
-                                let seal = fulfillment.seal;
-
-                                // Decode boundless receipt only for batch proofs using the uploaded batch image ID
-                                let receipt = match proof_type {
-                                    ProofType::Batch => {
-                                        if let Some(batch_image_id) =
-                                            self.image_manager.get_batch_image_id().await
-                                        {
-                                            match decode_seal(
-                                                seal.clone(),
-                                                crate::image_manager::ImageManager::digest_to_array(
-                                                    &batch_image_id,
-                                                ),
-                                                journal.clone(),
-                                            ) {
-                                                Ok(ContractReceipt::Base(boundless_receipt)) => {
-                                                    serde_json::to_string(&boundless_receipt).ok()
-                                                }
-                                                _ => None,
-                                            }
-                                        } else {
-                                            tracing::warn!(
-                                                "Batch image ID unavailable when decoding receipt"
-                                            );
-                                            None
-                                        }
-                                    }
-                                    _ => None, // Aggregation and other types get None
-                                };
-
-                                let response = Risc0Response {
-                                    seal: seal.to_vec(),
-                                    journal: journal.clone(),
-                                    receipt,
-                                };
-
-                                let proof_bytes = bincode::serialize(&response).map_err(|e| {
-                                    AgentError::ResponseEncodeError(format!(
-                                        "Failed to encode response: {e}"
-                                    ))
-                                })?;
-
-                                Ok(ProofRequestStatus::Fulfilled {
-                                    market_request_id,
-                                    proof: proof_bytes,
-                                })
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to get fulfillment for {}: {}",
-                                    request_id_str,
-                                    e
-                                );
-                                Ok(ProofRequestStatus::Failed {
-                                    error: format!("Failed to get proof data: {}", e),
-                                })
-                            }
-                        }
-                    }
-                    RequestStatus::Expired => {
-                        tracing::warn!(
-                            "Market status: MarketExpired({}) - request expired",
-                            request_id_str
-                        );
-                        Ok(ProofRequestStatus::Failed {
-                            error: "Request expired in boundless market".to_string(),
-                        })
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to get market status for {}: {}", request_id_str, e);
-                Ok(ProofRequestStatus::Failed {
-                    error: format!("Failed to check market status: {}", e),
-                })
-            }
-        }
-    }
-
     /// Process input and create guest environment
-    fn process_input(&self, input: Vec<u8>) -> AgentResult<(GuestEnv, Vec<u8>)> {
+    pub(crate) fn process_input(&self, input: Vec<u8>) -> AgentResult<(GuestEnv, Vec<u8>)> {
         let guest_env = GuestEnv::builder().write_frame(&input).build_env();
         let guest_env_bytes = guest_env.clone().encode().map_err(|e| {
             AgentError::ClientBuildError(format!("Failed to encode guest environment: {e}"))
@@ -723,7 +167,9 @@ impl BoundlessProver {
             config,
             deployment,
             boundless_config,
+            client: Arc::new(OnceCell::new()),
             active_requests: Arc::new(RwLock::new(HashMap::new())),
+            poll_error_counts: Arc::new(RwLock::new(HashMap::new())),
             storage: storage.clone(),
             image_manager: image_manager.clone(),
         };
@@ -736,7 +182,7 @@ impl BoundlessProver {
         {
             tracing::info!("Refreshing market URLs for uploaded images (TTL refresh)...");
 
-            let client = prover.create_boundless_client().await?;
+            let client = prover.get_boundless_client().await?;
 
             // Refresh batch image URL if exists
             if let Some(batch_info) = image_manager.get_batch_image().await {
@@ -744,7 +190,7 @@ impl BoundlessProver {
                     "Refreshing batch image market URL (content already cached in storage)"
                 );
                 image_manager
-                    .store_and_upload_image("batch", batch_info.elf_bytes.clone(), &client)
+                    .store_and_upload_image("batch", batch_info.elf_bytes.clone(), client)
                     .await?;
             }
 
@@ -754,7 +200,7 @@ impl BoundlessProver {
                     "Refreshing aggregation image market URL (content already cached in storage)"
                 );
                 image_manager
-                    .store_and_upload_image("aggregation", agg_info.elf_bytes.clone(), &client)
+                    .store_and_upload_image("aggregation", agg_info.elf_bytes.clone(), client)
                     .await?;
             }
 
@@ -771,14 +217,6 @@ impl BoundlessProver {
         Ok(prover)
     }
 
-    pub async fn get_batch_image_url(&self) -> Option<Url> {
-        self.image_manager.get_batch_image_url().await
-    }
-
-    pub async fn get_aggregation_image_url(&self) -> Option<Url> {
-        self.image_manager.get_aggregation_image_url().await
-    }
-
     pub fn prover_config(&self) -> ProverConfig {
         self.config.clone()
     }
@@ -793,6 +231,7 @@ impl BoundlessProver {
         request_id: String,
         proof_type: ProofType,
         input: Vec<u8>,
+        output: Vec<u8>,
         config: &serde_json::Value,
     ) -> AgentResult<String> {
         tracing::info!(
@@ -800,7 +239,6 @@ impl BoundlessProver {
             match proof_type {
                 ProofType::Batch => "batch",
                 ProofType::Aggregate => "aggregation",
-                ProofType::Update(_) => "update",
             },
             request_id
         );
@@ -811,7 +249,9 @@ impl BoundlessProver {
             status: ProofRequestStatus::Preparing,
             proof_type,
             input,
+            output,
             config: config.clone(),
+            last_error: None,
         };
 
         // Store the request for tracking (both memory and SQLite)
@@ -827,7 +267,6 @@ impl BoundlessProver {
                 match async_request.proof_type {
                     ProofType::Batch => "batch",
                     ProofType::Aggregate => "aggregation",
-                    ProofType::Update(_) => "update",
                 },
                 e
             );
@@ -837,7 +276,7 @@ impl BoundlessProver {
     }
 
     /// Helper method to update failed status in both memory and storage
-    async fn update_failed_status(&self, request_id: &str, error: String) {
+    pub(crate) async fn update_failed_status(&self, request_id: &str, error: String) {
         let failed_status = ProofRequestStatus::Failed { error };
         let _ = self
             .update_request_status(request_id, failed_status, &self.active_requests)
@@ -845,13 +284,16 @@ impl BoundlessProver {
     }
 
     /// Helper method to update request status in both memory and storage
-    async fn update_request_status(
+    pub(crate) async fn update_request_status(
         &self,
         request_id: &str,
         status: ProofRequestStatus,
         active_requests: &Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) -> AgentResult<()> {
-        let is_terminal = matches!(status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. });
+        let is_terminal = matches!(
+            status,
+            ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. }
+        );
 
         // Update status in memory
         {
@@ -875,6 +317,10 @@ impl BoundlessProver {
                     }
                     _ => {}
                 }
+                async_req.last_error = match &status {
+                    ProofRequestStatus::Failed { error } => Some(error.clone()),
+                    _ => None,
+                };
             }
         }
 
@@ -891,222 +337,8 @@ impl BoundlessProver {
         if is_terminal {
             let mut requests_guard = active_requests.write().await;
             requests_guard.remove(request_id);
+            self.clear_poll_errors(request_id).await;
         }
-
-        Ok(())
-    }
-
-    /// Helper method to perform a single market status poll
-    async fn poll_market_status(
-        &self,
-        request_id: &str,
-        market_request_id: U256,
-        proof_type: &ProofType,
-        active_requests: &Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    ) -> bool {
-        let market_id_str = format!("0x{:x}", market_request_id);
-
-        // Use retry logic for status polling to handle transient failures
-        let status_result = retry_with_backoff(
-            "check_market_status_polling",
-            || self.check_market_status(market_request_id, proof_type),
-            3, // Fewer retries since we poll periodically
-        )
-        .await;
-
-        match status_result {
-            Ok(new_status) => {
-                // Update the status using the helper
-                if let Err(e) = self
-                    .update_request_status(request_id, new_status.clone(), active_requests)
-                    .await
-                {
-                    tracing::warn!("Failed to update status for {}: {}", request_id, e);
-                }
-
-                // Check if we should stop polling (fulfilled or failed)
-                match new_status {
-                    ProofRequestStatus::Fulfilled { .. } => {
-                        tracing::info!("Proof {} completed via market", market_id_str);
-                        false // Stop polling
-                    }
-                    ProofRequestStatus::Failed { .. } => {
-                        tracing::error!("Proof {} failed via market", market_id_str);
-                        false // Stop polling
-                    }
-                    _ => {
-                        true // Continue polling
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to check market status for {}: {}", market_id_str, e);
-                true // Continue polling despite error
-            }
-        }
-    }
-
-    /// Helper method to handle polling timeout
-    async fn handle_polling_timeout(
-        &self,
-        request_id: &str,
-        active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    ) {
-        tracing::warn!(
-            "Request {} timed out after 1 hour, marking as failed",
-            request_id
-        );
-
-        let timeout_status = ProofRequestStatus::Failed {
-            error: "Request timed out after 1 hour".to_string(),
-        };
-
-        // Update status using helper
-        let _ = self
-            .update_request_status(request_id, timeout_status, &active_requests)
-            .await;
-
-        // Remove from memory
-        let mut requests_guard = active_requests.write().await;
-        requests_guard.remove(request_id);
-
-        tracing::info!("Removed timed out request {} from memory", request_id);
-    }
-
-    /// Helper method to start status polling for market requests
-    async fn start_status_polling(
-        &self,
-        request_id: &str,
-        market_request_id: U256,
-        proof_type: ProofType,
-        active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    ) {
-        let prover_clone = self.clone();
-        let request_id = request_id.to_string();
-
-        tokio::spawn(async move {
-            let poll_interval = Duration::from_secs(10);
-
-            // Create the polling future
-            let pollings = async {
-                while prover_clone
-                    .poll_market_status(
-                        &request_id,
-                        market_request_id,
-                        &proof_type,
-                        &active_requests,
-                    )
-                    .await
-                {
-                    tokio::time::sleep(poll_interval).await;
-                }
-            };
-
-            // Use timeout wrapper as suggested
-            match timeout(Duration::from_secs(3600), pollings).await {
-                Ok(_) => {
-                    tracing::info!("Polling finished before timeout for request {}", request_id);
-                }
-                Err(_) => {
-                    prover_clone
-                        .handle_polling_timeout(&request_id, active_requests)
-                        .await;
-                }
-            }
-        });
-    }
-
-    /// Helper method to process input, build request, and submit to market
-    async fn process_and_submit_request(
-        &self,
-        request_id: &str,
-        input: Vec<u8>,
-        output: Vec<u8>,
-        elf: &[u8],
-        image_url: Url,
-        offer_params: BoundlessOfferParams,
-        proof_type: ProofType,
-        active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    ) -> AgentResult<()> {
-        let boundless_client = retry_with_backoff(
-            "create_boundless_client",
-            || self.create_boundless_client(),
-            3, // Fewer retries for client creation
-        )
-        .await
-        .map_err(|e| {
-            AgentError::ClientBuildError(format!("Failed to create boundless client: {}", e))
-        })?;
-
-        // Process input and create guest environment
-        let (guest_env, guest_env_bytes) = self.process_input(input).map_err(|e| {
-            AgentError::GuestEnvEncodeError(format!("Failed to process input: {}", e))
-        })?;
-
-        // Evaluate cost
-        let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
-            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
-        let mcycles_count = 4000;
-
-        // Upload input to storage so provers fetch from a URL (preferred over inline)
-        tracing::info!(
-            "Uploading input ({} bytes) to storage provider",
-            guest_env_bytes.len()
-        );
-        let input_url = boundless_client
-            .upload_input(&guest_env_bytes)
-            .await
-            .map_err(|e| AgentError::UploadError(format!("Failed to upload input: {}", e)))?;
-        tracing::info!("Input uploaded: {}", input_url);
-        let input_url = Some(input_url);
-
-        // Build the request
-        let request = self
-            .build_boundless_request(
-                &boundless_client,
-                image_url,
-                elf,
-                input_url,
-                guest_env,
-                &offer_params,
-                mcycles_count as u32,
-                output,
-            )
-            .await
-            .map_err(|e| {
-                AgentError::RequestBuildError(format!("Failed to build request: {}", e))
-            })?;
-
-        // Submit to market
-        let market_request_id = self
-            .submit_request_async(&boundless_client, request)
-            .await
-            .map_err(|e| {
-                AgentError::RequestSubmitError(format!("Failed to submit to market: {}", e))
-            })?;
-
-        // Update the stored request with new market_request_id
-        {
-            let mut requests_guard = active_requests.write().await;
-            if let Some(async_req) = requests_guard.get_mut(request_id) {
-                async_req.market_request_id = market_request_id;
-                async_req.status = ProofRequestStatus::Submitted { market_request_id };
-            }
-        }
-
-        // Update in SQLite storage with correct market_request_id
-        let submitted_status = ProofRequestStatus::Submitted { market_request_id };
-        if let Err(e) = self
-            .storage
-            .update_status(request_id, &submitted_status)
-            .await
-        {
-            tracing::warn!("Failed to update market request ID in storage: {}", e);
-        }
-
-        // Start polling market status in background
-        self.start_status_polling(request_id, market_request_id, proof_type, active_requests)
-            .await;
 
         Ok(())
     }
@@ -1196,7 +428,13 @@ impl BoundlessProver {
 
         // Prepare and store the async request using the provided request ID
         let final_request_id = self
-            .prepare_async_request(request_id.clone(), ProofType::Batch, input.clone(), config)
+            .prepare_async_request(
+                request_id.clone(),
+                ProofType::Batch,
+                input.clone(),
+                output.clone(),
+                config,
+            )
             .await?;
 
         // Submit to boundless market in background
@@ -1332,6 +570,7 @@ impl BoundlessProver {
                 request_id.clone(),
                 ProofType::Aggregate,
                 input.clone(),
+                output.clone(),
                 config,
             )
             .await?;
@@ -1379,20 +618,105 @@ impl BoundlessProver {
         Ok(final_request_id)
     }
 
-    /// update elf
-    pub async fn update(
-        &self,
-        _request_id: String,
-        _elf: Vec<u8>,
-        _elf_type: ElfType,
-    ) -> AgentResult<String> {
-        todo!()
+    /// Retry a failed request using the stored input/config without resubmission
+    pub async fn retry_failed_request(&self, request_id: &str) -> AgentResult<String> {
+        let stored_request =
+            self.storage.get_request(request_id, true).await?.ok_or_else(|| {
+                AgentError::RetryError(format!("Request {} not found", request_id))
+            })?;
+
+        if !matches!(stored_request.status, ProofRequestStatus::Failed { .. }) {
+            return Err(AgentError::RetryError(format!(
+                "Request {} is not in a failed state",
+                request_id
+            )));
+        }
+
+        self.clear_poll_errors(request_id).await;
+
+        let mut retry_request = stored_request.clone();
+        retry_request.status = ProofRequestStatus::Preparing;
+        retry_request.market_request_id = U256::ZERO;
+        retry_request.last_error = None;
+
+        // Persist reset state and refresh memory cache
+        self.storage.store_request(&retry_request).await?;
+        {
+            let mut requests_guard = self.active_requests.write().await;
+            requests_guard.insert(request_id.to_string(), retry_request.clone());
+        }
+
+        let prover_clone = self.clone();
+        let active_requests = self.active_requests.clone();
+        let request_id_clone = request_id.to_string();
+        tokio::spawn(async move {
+            let proof_type = retry_request.proof_type.clone();
+            let input = retry_request.input.clone();
+            let output = retry_request.output.clone();
+
+            let result = match proof_type {
+                ProofType::Batch => {
+                    let offer_params = prover_clone.boundless_config.get_batch_offer_params();
+                    if let Some(image_info) = prover_clone.image_manager.get_batch_image().await {
+                        prover_clone
+                            .process_and_submit_request(
+                                &request_id_clone,
+                                input,
+                                output,
+                                &image_info.elf_bytes,
+                                image_info.market_url,
+                                offer_params,
+                                ProofType::Batch,
+                                active_requests,
+                            )
+                            .await
+                    } else {
+                        Err(AgentError::RetryError(
+                            "Batch image not uploaded. Please upload via /upload-image endpoint first."
+                                .to_string(),
+                        ))
+                    }
+                }
+                ProofType::Aggregate => {
+                    let offer_params = prover_clone.boundless_config.get_aggregation_offer_params();
+                    if let Some(image_info) =
+                        prover_clone.image_manager.get_aggregation_image().await
+                    {
+                        prover_clone
+                            .process_and_submit_request(
+                                &request_id_clone,
+                                input,
+                                output,
+                                &image_info.elf_bytes,
+                                image_info.market_url,
+                                offer_params,
+                                ProofType::Aggregate,
+                                active_requests,
+                            )
+                            .await
+                    } else {
+                        Err(AgentError::RetryError(
+                            "Aggregation image not uploaded. Please upload via /upload-image endpoint first."
+                                .to_string(),
+                        ))
+                    }
+                }
+            };
+
+            if let Err(e) = result {
+                prover_clone
+                    .update_failed_status(&request_id_clone, e.to_string())
+                    .await;
+            }
+        });
+
+        Ok(request_id.to_string())
     }
 
     /// Get the current status of an async request
     pub async fn get_request_status(&self, request_id: &str) -> Option<AsyncProofRequest> {
         // Try to get from SQLite storage first (most up-to-date)
-        match self.storage.get_request(request_id).await {
+        match self.storage.get_request(request_id, false).await {
             Ok(Some(request)) => {
                 // Cache only active requests; terminal ones stay in storage only
                 match request.status {
@@ -1437,7 +761,13 @@ impl BoundlessProver {
                 let requests_guard = self.active_requests.read().await;
                 requests_guard
                     .values()
-                    .filter(|req| !matches!(req.status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. }))
+                    .filter(|req| {
+                        !matches!(
+                            req.status,
+                            ProofRequestStatus::Fulfilled { .. }
+                                | ProofRequestStatus::Failed { .. }
+                        )
+                    })
                     .cloned()
                     .collect()
             }
@@ -1456,6 +786,7 @@ impl BoundlessProver {
 
         // Clear in-memory active requests as well
         self.active_requests.write().await.clear();
+        self.poll_error_counts.write().await.clear();
 
         tracing::info!(
             "Deleted {} requests from database and cleared memory cache",
@@ -1464,7 +795,7 @@ impl BoundlessProver {
         Ok(deleted_count)
     }
 
-    /// Start background TTL cleanup task that runs every 24 hours
+    /// Start background TTL cleanup task that runs every 3 hours
     async fn start_ttl_cleanup_task(
         storage: BoundlessStorage,
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
@@ -1475,7 +806,7 @@ impl BoundlessProver {
         }
 
         let cleanup_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Run hourly
+            let mut interval = tokio::time::interval(Duration::from_secs(3 * 3600)); // Run every 3 hours
             interval.tick().await; // Skip first immediate tick
 
             loop {
@@ -1510,6 +841,7 @@ impl BoundlessProver {
         *handle_guard = Some(cleanup_task);
     }
 
+    #[allow(dead_code)]
     async fn evaluate_cost(&self, guest_env: &GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
         let (mcycles_count, _journal) = {
             // Dry run the ELF with the input to get the journal and cycle count.
@@ -1537,7 +869,7 @@ impl BoundlessProver {
         Ok((mcycles_count, _journal))
     }
 
-    async fn build_boundless_request(
+    pub(crate) async fn build_boundless_request(
         &self,
         boundless_client: &Client,
         program_url: Url,
@@ -1711,7 +1043,12 @@ mod tests {
 
         // Test async request submission - should return a request ID
         let request_id = prover
-            .batch_run("test_request_id".to_string(), input_bytes, output_bytes, &config)
+            .batch_run(
+                "test_request_id".to_string(),
+                input_bytes,
+                output_bytes,
+                &config,
+            )
             .await
             .unwrap();
         println!("Submitted batch request with ID: {:?}", request_id);
@@ -1760,7 +1097,9 @@ mod tests {
         };
         let input = bincode::serialize(&input_data).unwrap();
         let config = serde_json::Value::default();
-        let output_struct = BoundlessAggregationGuestOutput { journal_digest: Digest::ZERO };
+        let output_struct = BoundlessAggregationGuestOutput {
+            journal_digest: Digest::ZERO,
+        };
         let output = bincode::serialize(&output_struct).unwrap();
 
         // Test async aggregation request submission
@@ -1769,7 +1108,12 @@ mod tests {
             .await
             .unwrap();
         let request_id = prover
-            .aggregate("test_aggregate_request_id".to_string(), input, output, &config)
+            .aggregate(
+                "test_aggregate_request_id".to_string(),
+                input,
+                output,
+                &config,
+            )
             .await
             .unwrap();
         println!("Submitted aggregation request with ID: {:?}", request_id);
