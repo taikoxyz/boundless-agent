@@ -6,10 +6,10 @@ use super::types::{
 use crate::api::handlers::{
     __path_delete_all_requests, __path_get_async_proof_status, __path_get_database_stats,
     __path_health_check, __path_image_info_handler, __path_list_async_requests,
-    __path_proof_handler, __path_upload_image_handler,
+    __path_proof_handler, __path_retry_proof_handler, __path_upload_image_handler,
 };
 use crate::image_manager::ImageDetails;
-use crate::{DatabaseStats, ElfType};
+use crate::DatabaseStats;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -56,6 +56,7 @@ Client → Boundless Agent → Boundless Market
     paths(
         health_check,
         proof_handler,
+        retry_proof_handler,
         get_async_proof_status,
         list_async_requests,
         get_database_stats,
@@ -67,7 +68,6 @@ Client → Boundless Agent → Boundless Market
         AsyncProofRequestData,
         AsyncProofResponse,
         ProofType,
-        ElfType,
         DetailedStatusResponse,
         RequestListResponse,
         HealthResponse,

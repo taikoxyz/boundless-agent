@@ -1,202 +1,83 @@
 # RISC0 Boundless Agent
 
-A command-line application for generating RISC0 Boundless proofs with support for both batch and aggregation proof types.
+Axum-based web service that brokers Batch and Aggregation proof requests to Boundless Market. The agent persists requests in SQLite, retries transient market errors with backoff, and polls fulfillment until completion.
 
-## Features
+## What it does
+- Accepts async proof jobs via HTTP (`/proof`) for `Batch` and `Aggregate` types.
+- Uploads guest ELFs to Boundless Market via `/upload-image/{batch|aggregation}` and keeps URLs fresh for TTL.
+- Stores and tracks requests in SQLite with background cleanup and retry support (`/retry/{request_id}`).
+- Polls market status with transient-error tolerance; only terminal failures mark a request as failed.
+- Serves OpenAPI/Swagger UI for all endpoints.
 
-- **Batch Proof Generation**: Generate proofs for individual blocks
-- **Aggregation Proof Generation**: Aggregate multiple batch proofs
-- **Flexible Input/Output**: Support for custom input and output files
-- **Configuration**: JSON-based configuration support
-- **ELF Support**: Custom ELF file support (optional)
-- **Verbose Logging**: Detailed output for debugging
-
-## Installation
-
+## Build & run
 ```bash
 cargo build --release
+
+# Minimal run (make sure envs below are set)
+BOUNDLESS_SIGNER_KEY=0x... ./target/release/boundless-agent \
+  --address 0.0.0.0 --port 9999 \
+  --rpc-url https://base-rpc.publicnode.com \
+  --pull-interval 10 \
+  --url-ttl 1800 \
+  --config-file ./config/boundless.example.json
 ```
 
-## Usage
+Key CLI flags (see `--help`):
+- `--address` / `--port`: HTTP bind.
+- `--rpc-url`: Market RPC URL (overrides config file).
+- `--pull-interval`: Poll interval seconds for market status (min 5s).
+- `--url-ttl`: How long to keep presigned URLs before re-upload.
+- `--offchain`: Submit requests offchain instead of onchain.
+- `--config-file`: JSON config merged over defaults (deployment/offer params/RPC URL).
 
-### Basic Usage
+## Required environment
+- `BOUNDLESS_SIGNER_KEY`: Hex private key used for market submissions.
+- `BOUNDLESS_RPC_URL`: Optional; defaults to Base public RPC unless overridden by config/flag.
+- `SQLITE_DB_PATH`: Optional; path to request DB (default `./boundless_requests.db`).
+- `POLL_ERROR_THRESHOLD`: Optional; consecutive poll failures before marking failed (default 5).
 
-```bash
-# Generate a batch proof
-./target/release/boundless-agent -i input.bin -o proof.bin -t batch
+## Storage & cleanup
+- Requests are persisted in SQLite; in-memory cache holds only non-terminal requests.
+- Terminal requests (`fulfilled`/`failed`) are deleted after ~3 hours (set at insert time) by a background cleanup task running every 3 hours.
+- SQLite is configured for incremental auto-vacuum, and TTL cleanup triggers `wal_checkpoint(TRUNCATE)` + `incremental_vacuum(0)` after deletions to reclaim disk space.
 
-# Generate an aggregation proof
-./target/release/boundless-agent -i input.bin -o proof.bin -t agg
+## API (HTTP)
+- `POST /proof`: Submit async proof. Body:
+  ```json
+  { "input": [..bytes..], "output": [..bytes..], "proof_type": "Batch|Aggregate", "config": {} }
+  ```
+  Returns `{ request_id, market_request_id, status }` (status starts at `preparing`).
+- `GET /status/{request_id}`: Detailed status + proof bytes when complete.
+- `GET /requests`: List active requests.
+- `POST /retry/{request_id}`: Manually retry a failed request using stored input/config.
+- `DELETE /requests`: Delete all stored requests.
+- `POST /upload-image/{batch|aggregation}`: Upload ELF; agent stores and posts to market.
+- `GET /images`: Returns uploaded image IDs/URLs.
+- `GET /health`: Liveness.
+- Swagger UI: `/swagger-ui` or `/scalar`.
 
-# With verbose output
-./target/release/boundless-agent -i input.bin -o proof.bin -t batch -v
-```
-
-### Advanced Usage
-
-```bash
-# With custom configuration
-./target/release/boundless-agent -i input.bin -o proof.bin -c config.json -t batch
-
-# Full example with all options
-./target/release/boundless-agent \
-  -i input.bin \
-  -o proof.bin \
-  -t agg \
-  -c config.json \
-  -v
-```
-
-## Command Line Options
-
-| Option | Short | Long | Description | Required |
-|--------|-------|------|-------------|----------|
-| Input file | `-i` | `--input` | Path to input file | Yes |
-| Output file | `-o` | `--output` | Path to output file (proof will be saved here) | Yes |
-| Proof type | `-t` | `--proof-type` | `batch` or `agg` | No (default: batch) |
-| Config file | `-c` | `--config` | Path to JSON config file | No |
-| Verbose | `-v` | `--verbose` | Enable verbose output | No |
+Only Batch/Aggregate are supported; the Update path has been removed.
 
 ## Configuration
+`config/boundless.example.json` shows the shape. Core pieces:
+- `deployment.deployment_type`: `Sepolia` or `Base` (merged with defaults).
+- `deployment.overrides.order_stream_url`: Optional URL override.
+- `offer_params.batch|aggregation`: Pricing/timeouts for each proof type (see `src/config.rs` defaults).
+- `rpc_url`: Optional RPC override.
 
-The application supports JSON-based configuration. See `config.example.json` for a complete example.
+At startup the agent merges defaults with the provided config file and CLI flags.
 
-### Configuration Structure
-
-```json
-{
-  "boundless": {
-    "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
-    "deployment": "sepolia",
-    "max_price": "0.0005",
-    "min_price": "0.0001",
-    "timeout": 4000,
-    "lock_timeout": 2000,
-    "ramp_up": 1000
-  },
-  "prover": {
-    "execution_po2": 18,
-    "profile": false
-  }
-}
-```
-
-### Deployment Types
-
-The agent supports two deployment types:
-
-1. **Sepolia** (default): Uses the Sepolia testnet deployment
-2. **Base**: Uses the Base mainnet deployment
-
-The `order_stream_url` can be used to override the default order stream URL for any deployment type.
-
-For detailed configuration examples, see [DEPLOYMENT_CONFIG_EXAMPLES.md](DEPLOYMENT_CONFIG_EXAMPLES.md).
-
-## Environment Variables
-
-- `BOUNDLESS_SIGNER_KEY`: Private key for signing transactions (required)
-- `SQLITE_DB_PATH`: (Optional) Path to SQLite database for persistent request storage (default: `./boundless_requests.db`)
-
-## Command Line Arguments
-
-- `--deployment-type`: Deployment type to use (sepolia or base, default: sepolia)
-- `--rpc-url`: RPC URL for the deployment (default: https://ethereum-sepolia-rpc.publicnode.com)
-- `--order-stream-url`: Order stream URL (optional)
-- `--offchain`: Enable offchain mode (default: false)
-- `--pull-interval`: Pull interval in seconds (default: 10)
-- `--signer-key`: Signer private key (optional, can also be set via BOUNDLESS_SIGNER_KEY env var)
-
-## Output
-
-The application saves the generated proof data to the specified output file in binary format.
-
-```bash
-# The proof will be saved to proof.bin
-./target/release/boundless-agent -i input.bin -o proof.bin -t batch
-```
-
-## Error Handling
-
-The application provides detailed error messages for:
-- File read/write errors
-- Invalid configuration
-- Network errors
-- Proof generation failures
-
-## Examples
-
-### Generate a Batch Proof
-
-```bash
-# Simple batch proof
-./target/release/boundless-agent -i block_input.bin -o batch_proof.bin -t batch
-
-# With verbose output
-./target/release/boundless-agent -i block_input.bin -o batch_proof.bin -t batch -v
-```
-
-### Generate an Aggregation Proof
-
-```bash
-# Simple aggregation proof
-./target/release/boundless-agent -i agg_input.bin -o agg_proof.bin -t agg
-
-# With custom configuration
-./target/release/boundless-agent -i agg_input.bin -o agg_proof.bin -t agg -c my_config.json
-```
-
-### ELF upload workflow
-
-The agent does not ship or store guest ELF binaries on disk. A client (for example, Raiko) must upload the batch and aggregation ELFs to the agent via the `/upload-image/{batch|aggregation}` endpoint before submitting proofs. The agent uploads them to Boundless Market and keeps them in memory for TTL refreshes. There are no baked-in image IDs or local ELF files in this repo.
-
-### Using Different Deployment Types
-
-```bash
-# Use Sepolia deployment (default)
-./target/release/boundless-agent --deployment-type sepolia
-
-# Use Base deployment
-./target/release/boundless-agent --deployment-type base
-
-# Use custom order stream URL
-./target/release/boundless-agent --deployment-type sepolia --order-stream-url https://custom-order-stream.com
-
-# Use offchain mode
-./target/release/boundless-agent --deployment-type base --offchain --order-stream-url https://offchain-order-stream.com
-```
-
-### Using Custom SQLite Database Path (Optional)
-
-By default, the database is stored at `./boundless_requests.db` in the current working directory. To use a different location:
-
-```bash
-# Example: Store database in a different directory
-SQLITE_DB_PATH="/var/lib/boundless/requests.db" ./target/release/boundless-agent
-
-# Example: Store in user's home directory
-SQLITE_DB_PATH="$HOME/.boundless/requests.db" ./target/release/boundless-agent
-```
+## Workflow tips
+1) Upload both ELFs via `/upload-image/batch` and `/upload-image/aggregation` before sending proofs.
+2) Submit proof via `/proof` with `proof_type` `Batch` or `Aggregate`.
+3) Poll `/status/{id}` or rely on `/requests` for progress; errors are retriable via `/retry/{id}`.
 
 ## Development
-
-### Building
-
 ```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-```
-
-### Testing
-
-```bash
+cargo check
 cargo test
 ```
 
-### Running Tests with Logging
-
-```bash
+Modules are split for clarity: `main.rs` wiring, `api/` HTTP handlers/DTOs, `boundless.rs` orchestration, `market.rs` market I/O + polling, `storage.rs` SQLite, `image_manager.rs` ELF lifecycle, plus `config.rs`/`types.rs`/`utils.rs`/`retry.rs`.
 RUST_LOG=debug cargo test
 ``` 

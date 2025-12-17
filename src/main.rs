@@ -1,13 +1,17 @@
 pub mod api;
 pub mod boundless;
+pub mod config;
 pub mod image_manager;
+pub mod market;
 pub mod rate_limit;
+pub mod retry;
 pub mod storage;
+pub mod types;
+pub mod utils;
 
-pub use boundless::{
-    AgentError, AgentResult, AsyncProofRequest, BoundlessProver, DeploymentType, ElfType,
-    ProofRequestStatus, ProofType as BoundlessProofType, ProverConfig, generate_request_id,
-};
+pub use boundless::{AgentError, AgentResult, BoundlessProver, ProverConfig};
+pub use types::{AsyncProofRequest, ProofRequestStatus, ProofType, Risc0Response};
+pub use utils::generate_request_id;
 pub use image_manager::ImageManager;
 pub use rate_limit::RateLimiter;
 pub use storage::{BoundlessStorage, DatabaseStats};
@@ -27,9 +31,11 @@ use api::{
     create_docs,
     handlers::{
         delete_all_requests, get_async_proof_status, get_database_stats, health_check,
-        image_info_handler, list_async_requests, proof_handler, upload_image_handler,
+        image_info_handler, list_async_requests, proof_handler, retry_proof_handler,
+        upload_image_handler,
     },
 };
+use config::BoundlessConfig;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -157,11 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Initializing prover...");
 
     // Load boundless config from file if provided, otherwise use default
-    let mut boundless_config = boundless::BoundlessConfig::default();
+    let mut boundless_config = BoundlessConfig::default();
     if let Some(config_file) = &args.config_file {
         let config_content = std::fs::read_to_string(config_file)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
-        let file_config: boundless::BoundlessConfig = serde_json::from_str(&config_content)
+        let file_config: BoundlessConfig = serde_json::from_str(&config_content)
             .map_err(|e| format!("Failed to parse config file: {}", e))?;
         boundless_config.merge(&file_config);
     }
@@ -204,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/proof", post(proof_handler))
+        .route("/proof/:request_id/retry", post(retry_proof_handler))
         .route("/status/:request_id", get(get_async_proof_status))
         .route("/requests", get(list_async_requests))
         .route("/prune", delete(delete_all_requests))
