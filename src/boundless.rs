@@ -891,12 +891,12 @@ impl BoundlessProver {
             ))
         })? * U256::from(mcycles_count);
 
-        // let min_price = parse_ether(&offer_spec.min_price_per_mcycle).map_err(|e| {
-        //     AgentError::ClientBuildError(format!(
-        //         "Failed to parse min_price_per_mcycle: {} ({})",
-        //         offer_spec.min_price_per_mcycle, e
-        //     ))
-        // })? * U256::from(mcycles_count);
+        let min_price = parse_ether(&offer_spec.min_price_per_mcycle).map_err(|e| {
+            AgentError::ClientBuildError(format!(
+                "Failed to parse min_price_per_mcycle: {} ({})",
+                offer_spec.min_price_per_mcycle, e
+            ))
+        })? * U256::from(mcycles_count);
 
         let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
         let lock_timeout = (offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32) as u32;
@@ -919,7 +919,7 @@ impl BoundlessProver {
                     .lock_timeout(lock_timeout)
                     .timeout(timeout)
                     .max_price(max_price)
-                    // .min_price(min_price)
+                    .min_price(min_price)
                     .lock_collateral(lock_collateral)
                     .bidding_start(
                         std::time::SystemTime::now()
