@@ -205,12 +205,12 @@ pub async fn proof_handler(
     let result = match request.proof_type {
         ProofType::Batch => {
             prover
-                .batch_run(request_id.clone(), request.input, &config)
+                .batch_run(request_id.clone(), request.input, request.output, &config)
                 .await
         }
         ProofType::Aggregate => {
             prover
-                .aggregate(request_id.clone(), request.input, &config)
+                .aggregate(request_id.clone(), request.input, request.output, &config)
                 .await
         }
         ProofType::Update(elf_type) => {

@@ -23,6 +23,8 @@ pub struct AsyncProofRequestData {
     /// Binary input data as array of bytes
     #[schema(example = json!([1, 2, 3, 4, 5]))]
     pub input: Vec<u8>,
+    #[schema(example = json!([1, 2, 3, 4, 5]))]
+    pub output: Vec<u8>,
     /// Type of proof to generate
     #[schema(example = json!("Batch"))]
     pub proof_type: ProofType,
