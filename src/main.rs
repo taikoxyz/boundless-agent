@@ -138,7 +138,10 @@ struct CmdArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    // Write logs to stdout so Kubernetes/GCP doesn't treat them as errors
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stdout)
+        .init();
     tracing::info!("Starting RISC0 Boundless Agent Web Service...");
 
     let args = CmdArgs::parse();
